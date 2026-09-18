@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8"
+clap = { version = "4", features = ["derive"] }
 axum-extra = { version = "0.10", features = ["query"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 sqlx = { version = "0.8", default-features = false, features = [

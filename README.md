@@ -14,11 +14,46 @@ Axum + Tokio + SQLx，連線 PostgreSQL / TimescaleDB。
 ## 快速開始
 
 ```sh
-cp config.example.toml config.toml   # 修改資料庫連線與 API Key
-cargo run                            # 或 cargo run -- /path/to/config.toml
+cp config.example.toml config.toml            # 修改資料庫連線與 API Key
+./netflow-query-api --check-config            # 部署前先確認設定檔沒寫錯
+./netflow-query-api
 ```
 
-預設監聽 `0.0.0.0:8081`。日誌層級可用 `RUST_LOG` 覆寫。
+預設監聽 `0.0.0.0:8081`。日誌層級可用 `RUST_LOG` 覆寫（例如 `RUST_LOG=debug`）。
+
+## 命令列介面
+
+```
+Usage: netflow-query-api [OPTIONS]
+
+Options:
+  -c, --config <PATH>  設定檔路徑 [default: config.toml]
+      --check-config   只驗證設定檔後結束，不連線資料庫、不監聽埠號
+      --check-dbconn   連同資料庫連線一起驗證（須搭配 --check-config）
+  -h, --help           Print help (see more with '--help')
+  -V, --version        Print version
+```
+
+`--check-config` 會印出解析後的設定摘要並以結束碼表示結果（0 = 通過），
+適合放進部署腳本。它印的是**實際生效的值**，不是設定檔的原文——例如
+白名單裡寫 `10.0.0.5` 會顯示為 `10.0.0.5/32`，`threshold_check.allowed_ips`
+留空會直接標示「門檻檢查端點停用」。
+
+```
+$ netflow-query-api --check-config
+設定檔 config.toml 檢查通過
+  監聽位址        0.0.0.0:8081
+  資料庫          localhost:5432/netflow（user=netflow_ro, max_connections=5）
+  API Key         2 把：dashboard, monitor
+  受信任代理      無（一律以 TCP 對端 IP 為準）
+  門檻檢查來源    10.0.0.5/32, 192.168.1.0/24
+  單次 IP 上限    50
+  分佈回溯上限    395 天
+```
+
+`--check-dbconn` 必須搭配 `--check-config`，會在設定檢查通過後實際連一次
+資料庫並下一道查詢——連線建立成功不代表這條 session 能用（權限、
+`search_path` 之類的問題要實際查詢才會浮現）。
 
 ## 認證
 
