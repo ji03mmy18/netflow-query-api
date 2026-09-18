@@ -1,0 +1,51 @@
+# NetFlow Query API 設定檔
+# 複製為 config.toml 後修改。所有欄位都在這裡，程式不讀環境變數。
+
+[server]
+host = "0.0.0.0"
+port = 8081
+
+[database]
+# 建議使用「唯讀」帳號，與 collector 的寫入帳號分開。
+# 本 API 只做 SELECT，不需要任何寫入權限。
+host = "localhost"
+port = 5432
+name = "netflow"
+user = "netflow_ro"
+password = "changeme"
+max_connections = 5
+
+[auth]
+# 反向代理白名單：只有來自這些網段的連線，其 X-Forwarded-For /
+# X-Real-IP header 才會被採信。留空表示一律以 TCP 對端 IP 為準。
+#
+# ⚠ 這直接影響 [threshold_check] 的來源 IP 驗證強度：若把不受控的
+#    來源放進來，對方就能用 header 偽造自己的 IP 繞過白名單。
+trusted_proxies = []
+
+# API Key 清單。請求需帶 header：X-API-Key: <key>
+# name 僅用於日誌辨識，不參與驗證。
+[[auth.keys]]
+name = "dashboard"
+key = "changeme-dashboard-key"
+
+[[auth.keys]]
+name = "monitor"
+key = "changeme-monitor-key"
+
+[threshold_check]
+# GET /api/v1/usage/exceeded 專用的來源 IP 白名單。
+# 該端點會列舉所有超過門檻的 IP，等於間接吐出監控清單，
+# 因此除了 API Key 之外額外要求來源 IP 必須落在這裡。
+#
+# 空陣列 = 關閉此端點（fail-closed）。單一 IP 可省略 /32。
+allowed_ips = []
+
+[limits]
+# 當日用量查詢單次可帶的 IP 數量上限
+max_ips_per_request = 50
+
+# 一日分佈（flow_stat_5m）可回溯的天數上限。
+# 必須 <= schema 中 flow_stat_5m 的 retention（目前 13 個月）；
+# 超過此範圍的日期會回 422，而不是靜默回傳一整片 0。
+distribution_max_age_days = 395
