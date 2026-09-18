@@ -208,9 +208,39 @@ fn print_config_summary(path: &Path, config: &LoadedConfig) {
     );
 }
 
+/// 等待關機訊號。
+///
+/// SIGINT 與 SIGTERM 都要收：前者是終端上的 Ctrl-C，後者是 `systemctl stop`
+/// 與容器執行期實際送出的訊號。只收 SIGINT 的話，服務在 systemd 底下會被
+/// 預設處置直接終止，graceful shutdown 完全不會執行——而且看起來一切正常，
+/// 因為程序確實結束了。
+///
+/// 訊號處理器安裝失敗時改為永久等待，而不是直接返回：返回會被上層當成
+/// 「收到關機訊號」，服務會在啟動後立刻自己關掉。
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::error!(%error, "failed to install ctrl-c handler");
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let interrupt = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install SIGINT handler");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    let terminate = async {
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = interrupt => tracing::info!("SIGINT received; shutting down"),
+        _ = terminate => tracing::info!("SIGTERM received; shutting down"),
     }
-    tracing::info!("shutdown signal received");
 }

@@ -111,12 +111,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # 打包成可直接 scp 上去的一包。
-      # 設定範本與端點文件一起附上，部署時不必再回 repo 翻。
+      # 設定範本、systemd unit 與端點文件一起附上，部署時不必再回 repo 翻。
       - name: Package
         run: |
           mkdir -p dist
           cp target/release/netflow-query-api dist/
           cp config.example.toml README.md dist/
+          cp *.service.example dist/
           tar -czf "netflow-query-api-linux-${{ matrix.arch }}.tar.gz" -C dist .
 
       - uses: actions/upload-artifact@v4

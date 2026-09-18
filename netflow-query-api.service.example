@@ -1,0 +1,123 @@
+# netflow-query-api systemd unit 範例
+#
+# 安裝：
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin netflow
+#   sudo mkdir -p /opt/netflow-query-api
+#   sudo tar -xzf netflow-query-api-linux-amd64.tar.gz -C /opt/netflow-query-api
+#   sudo cp /opt/netflow-query-api/config.example.toml /opt/netflow-query-api/config.toml
+#   sudo $EDITOR /opt/netflow-query-api/config.toml
+#
+#   # config.toml 含資料庫密碼與 API Key，權限要收緊
+#   sudo chown -R root:netflow /opt/netflow-query-api
+#   sudo chmod 640 /opt/netflow-query-api/config.toml
+#   sudo chmod 755 /opt/netflow-query-api/netflow-query-api
+#
+#   # 部署前先確認設定檔沒寫錯（會印出實際生效的值）
+#   sudo -u netflow /opt/netflow-query-api/netflow-query-api \
+#       --config /opt/netflow-query-api/config.toml --check-config --check-dbconn
+#
+#   sudo cp netflow-query-api.service.example /etc/systemd/system/netflow-query-api.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now netflow-query-api
+#
+# 檢視日誌：journalctl -u netflow-query-api -f
+#
+# 檔案擁有者刻意設為 root、群組為 netflow：服務只需要讀取，不該有能力
+# 覆寫自己的執行檔或設定檔。
+
+[Unit]
+Description=NetFlow Query API
+Documentation=https://github.com/ji03mmy18/netflow-query-api
+After=network-online.target
+Wants=network-online.target
+# 若 PostgreSQL 在同一台機器上，取消下一行的註解
+#After=postgresql.service
+
+[Service]
+Type=exec
+User=netflow
+Group=netflow
+WorkingDirectory=/opt/netflow-query-api
+
+# 設定檔用絕對路徑指定，不依賴 WorkingDirectory：日後若改動工作目錄，
+# 服務不會突然去讀另一個（或不存在的）設定檔。
+ExecStart=/opt/netflow-query-api/netflow-query-api --config /opt/netflow-query-api/config.toml
+
+# 設定檔寫錯時在啟動前就失敗，並把實際生效的值印進 journal。
+# 沒有這行的話，設定問題要等服務啟動失敗才發現，而 journal 裡只有
+# 一行錯誤訊息，看不到其他設定被解讀成什麼。
+ExecStartPre=/opt/netflow-query-api/netflow-query-api --config /opt/netflow-query-api/config.toml --check-config
+
+# 資料庫尚未就緒時服務會在 10 秒後結束（連線逾時），靠重啟自行收斂，
+# 不需要在 unit 裡描述精確的開機順序。
+Restart=on-failure
+RestartSec=5
+
+# 服務收到 SIGTERM 後會停止接受新連線並等現有請求結束。
+# 正常情況遠快於此，這只是上限。
+TimeoutStopSec=30
+
+# 日誌走 stdout/stderr 由 journald 收集。層級可在此覆寫：
+#Environment=RUST_LOG=debug
+
+# ---------------------------------------------------------------
+# 安全強化
+#
+# 這個服務的行為很單純：讀一個設定檔、連 PostgreSQL、監聽一個 TCP 埠。
+# 它不寫任何檔案、不需要任何 capability（埠號 > 1024）、不執行子程序。
+# 因此可以把權限收到很緊。
+# ---------------------------------------------------------------
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# @system-service 仍包含 @privileged 與 @resources，再減掉它們。
+# 這個服務不改檔案擁有者、不設排程優先權、不調 rlimit——post-exec 完全
+# 用不到這兩組（systemd 是在 exec 之前才做 setuid 與設定 limit 的）。
+SystemCallFilter=~@privileged @resources
+
+# 被攔下的 syscall 回 ENOSYS 而不是 EPERM。
+# glibc 會探測較新的 syscall（clone3、statx 之類）並在得到 ENOSYS 時
+# 退回舊做法；回 EPERM 會讓那個 fallback 不觸發，變成難以理解的失敗。
+# 這也是 Docker 預設 seccomp profile 改用 ENOSYS 的原因。
+SystemCallErrorNumber=ENOSYS
+
+# 服務不使用 SysV IPC，離開時一併清掉，避免殘留物累積。
+RemoveIPC=true
+
+# AF_NETLINK 不能省：glibc 的 getaddrinfo() 會用 netlink 列舉本機網路
+# 介面，少了它，設定檔中資料庫若以主機名稱指定會解析失敗。這個錯誤
+# 看起來像 DNS 壞了，很難聯想到是 unit 的限制造成的。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# 刻意不設 IPAddressAllow/IPAddressDeny：這是伺服器，要接受來自任意
+# 客戶端的連線，而這兩個指令對進出方向同時生效，設了會把客戶端擋掉。
+# 若你的呼叫端集中在特定網段，可以改成白名單（記得包含資料庫主機）：
+#IPAddressDeny=any
+#IPAddressAllow=localhost 10.0.0.0/8
+
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -167,6 +167,51 @@ GET /api/v1/usage/exceeded?threshold_mib=1024
 | `VALIDATION_ERROR` | 422 |
 | `DATABASE_ERROR` | 500 |
 
+## 部署（systemd）
+
+[`netflow-query-api.service.example`](netflow-query-api.service.example) 是可直接使用的
+unit 範例，預設路徑為 `/opt/netflow-query-api`、執行身分為 `netflow`。檔案開頭有完整
+安裝步驟，摘要如下：
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin netflow
+sudo mkdir -p /opt/netflow-query-api
+sudo tar -xzf netflow-query-api-linux-amd64.tar.gz -C /opt/netflow-query-api
+sudo cp /opt/netflow-query-api/config.example.toml /opt/netflow-query-api/config.toml
+sudo $EDITOR /opt/netflow-query-api/config.toml
+
+# config.toml 含資料庫密碼與 API Key
+sudo chown -R root:netflow /opt/netflow-query-api
+sudo chmod 640 /opt/netflow-query-api/config.toml
+
+sudo cp netflow-query-api.service.example /etc/systemd/system/netflow-query-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now netflow-query-api
+```
+
+檔案擁有者刻意設為 `root`、群組為 `netflow`：服務只需要讀取，不該有能力覆寫
+自己的執行檔或設定檔。
+
+unit 裡有幾個值得知道的設定：
+
+- **`ExecStartPre` 會先跑 `--check-config`**，設定寫錯時在啟動前就失敗，並把實際
+  生效的值印進 journal。沒有這行的話，設定問題只會留下一行啟動失敗訊息，看不到
+  其他設定被解讀成什麼。
+- **資料庫未就緒不需要在 unit 裡描述開機順序**。服務會在連線逾時（10 秒）後結束，
+  靠 `Restart=on-failure` + `RestartSec=5` 自行收斂。
+- **`RestrictAddressFamilies` 必須包含 `AF_NETLINK`**。glibc 的 `getaddrinfo()` 會用
+  netlink 列舉本機網路介面，少了它，設定檔中資料庫若以主機名稱（而非 IP）指定
+  會解析失敗——而症狀看起來像 DNS 壞了，很難聯想到是 unit 的限制造成的。
+
+服務同時處理 SIGINT 與 SIGTERM，`systemctl stop` 會觸發 graceful shutdown
+（停止接受新連線、等現有請求結束）。可在 journal 中確認：
+
+```sh
+sudo systemctl stop netflow-query-api
+journalctl -u netflow-query-api -n 5
+# 應看到 "SIGTERM received; shutting down" 與 "shutdown complete"
+```
+
 ## 建置與發佈
 
 本機建置：
