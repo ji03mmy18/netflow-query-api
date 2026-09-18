@@ -1,6 +1,7 @@
 //! 四支查詢的 SQL 與補零邏輯。
 //!
-//! 用量定義統一為 `ext_rx_bytes + ext_tx_bytes`。
+//! 四個 bytes 欄位原樣取出，對外合計（`internetTotalBytes`）在 Rust 端算，
+//! 定義集中在 [`Usage::new`] 一處。
 //!
 //! 補零一律在 Rust 端做，不使用 `time_bucket_gapfill`：
 //!   - `flow_stat_1d` 是普通表、`day` 是 `date`，gapfill 用起來不順；
@@ -16,40 +17,44 @@ use sqlx::PgPool;
 
 use crate::error::ApiResult;
 use crate::models::{
-    BucketUsage, DailyDistribution, DayUsage, ExceededReport, IpUsage, TodayUsage, WeekUsage,
+    BucketUsage, DailyDistribution, DayUsage, ExceededReport, IpUsage, TodayUsage, Usage, WeekUsage,
 };
 use crate::timeutil::{BUCKETS_PER_DAY, BUCKET_SECONDS, day_bounds_utc, to_taipei_rfc3339};
+
+/// 四個 bytes 欄位的取用順序，所有查詢共用，避免各處自行拼寫而錯位。
+const BYTE_COLUMNS: &str = "ext_rx_bytes, ext_tx_bytes, intra_rx_bytes, intra_tx_bytes";
 
 /// 一、當日用量（多 IP）
 ///
 /// `ips` 的順序與內容原樣保留在回應中：沒有資料的 IP 補 0，呼叫端送出的
 /// 每一個位址都會拿到一筆結果，不必自己比對哪些被省略了。
 pub async fn today_usage(pool: &PgPool, day: NaiveDate, ips: &[IpAddr]) -> ApiResult<TodayUsage> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        r#"
-        SELECT host(addr) AS ip,
-               ext_rx_bytes + ext_tx_bytes AS bytes
-        FROM flow_stat_1d
-        WHERE day = $1
-          AND addr = ANY($2)
-        "#,
-    )
-    .bind(day)
-    .bind(ips)
-    .fetch_all(pool)
-    .await?;
+    let sql = format!(
+        "SELECT host(addr) AS ip, {BYTE_COLUMNS}
+         FROM flow_stat_1d
+         WHERE day = $1
+           AND addr = ANY($2)"
+    );
+
+    let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(&sql)
+        .bind(day)
+        .bind(ips)
+        .fetch_all(pool)
+        .await?;
 
     // 以 IpAddr 而非字串當 key：host(addr) 的正規化形式由 Postgres 決定，
     // IpAddr::to_string() 的由 Rust 決定。IPv4 兩者必然一致，IPv6 則不保證
     // （壓縮零段的寫法、IPv4-mapped 的呈現方式都有空間）。一旦不一致，
     // 症狀是「這個 IP 明明有資料卻回報 0」，沒有任何錯誤訊息。
-    let found: HashMap<IpAddr, i64> = rows
+    let mut found: HashMap<IpAddr, Usage> = rows
         .into_iter()
-        .filter_map(|(text, bytes)| match text.parse::<IpAddr>() {
-            Ok(ip) => Some((ip, bytes)),
-            Err(_) => {
-                tracing::error!(addr = %text, "host(addr) returned an unparsable address");
-                None
+        .filter_map(|(text, ext_rx, ext_tx, intra_rx, intra_tx)| {
+            match text.parse::<IpAddr>() {
+                Ok(ip) => Some((ip, Usage::new(ext_rx, ext_tx, intra_rx, intra_tx))),
+                Err(_) => {
+                    tracing::error!(addr = %text, "host(addr) returned an unparsable address");
+                    None
+                }
             }
         })
         .collect();
@@ -58,7 +63,7 @@ pub async fn today_usage(pool: &PgPool, day: NaiveDate, ips: &[IpAddr]) -> ApiRe
         .iter()
         .map(|ip| IpUsage {
             ip: ip.to_string(),
-            bytes: found.get(ip).copied().unwrap_or(0),
+            usage: found.remove(ip).unwrap_or_else(Usage::zero),
         })
         .collect();
 
@@ -72,30 +77,35 @@ pub async fn today_usage(pool: &PgPool, day: NaiveDate, ips: &[IpAddr]) -> ApiRe
 pub async fn week_usage(pool: &PgPool, today: NaiveDate, ip: IpAddr) -> ApiResult<WeekUsage> {
     let first = today - Duration::days(6);
 
-    let rows: Vec<(NaiveDate, i64)> = sqlx::query_as(
-        r#"
-        SELECT day,
-               ext_rx_bytes + ext_tx_bytes AS bytes
-        FROM flow_stat_1d
-        WHERE addr = $1
-          AND day >= $2
-          AND day <= $3
-        ORDER BY day
-        "#,
-    )
-    .bind(ip)
-    .bind(first)
-    .bind(today)
-    .fetch_all(pool)
-    .await?;
+    let sql = format!(
+        "SELECT day, {BYTE_COLUMNS}
+         FROM flow_stat_1d
+         WHERE addr = $1
+           AND day >= $2
+           AND day <= $3
+         ORDER BY day"
+    );
 
-    let found: HashMap<NaiveDate, i64> = rows.into_iter().collect();
+    let rows: Vec<(NaiveDate, i64, i64, i64, i64)> = sqlx::query_as(&sql)
+        .bind(ip)
+        .bind(first)
+        .bind(today)
+        .fetch_all(pool)
+        .await?;
+
+    let mut found: HashMap<NaiveDate, Usage> = rows
+        .into_iter()
+        .map(|(day, ext_rx, ext_tx, intra_rx, intra_tx)| {
+            (day, Usage::new(ext_rx, ext_tx, intra_rx, intra_tx))
+        })
+        .collect();
+
     let days = (0..7)
         .map(|offset| {
             let day = first + Duration::days(offset);
             DayUsage {
                 day: day.to_string(),
-                bytes: found.get(&day).copied().unwrap_or(0),
+                usage: found.remove(&day).unwrap_or_else(Usage::zero),
             }
         })
         .collect();
@@ -116,28 +126,31 @@ pub async fn daily_distribution(
     ip: IpAddr,
     now: DateTime<Utc>,
 ) -> ApiResult<DailyDistribution> {
-    let (start, end) = day_bounds_utc(date).ok_or_else(|| {
-        crate::error::ApiError::validation(format!("{date} 不是合法的日期"))
-    })?;
+    let (start, end) = day_bounds_utc(date)
+        .ok_or_else(|| crate::error::ApiError::validation(format!("{date} 不是合法的日期")))?;
 
-    let rows: Vec<(DateTime<Utc>, i64)> = sqlx::query_as(
-        r#"
-        SELECT bucket,
-               ext_rx_bytes + ext_tx_bytes AS bytes
-        FROM flow_stat_5m
-        WHERE addr = $1
-          AND bucket >= $2
-          AND bucket <  $3
-        ORDER BY bucket
-        "#,
-    )
-    .bind(ip)
-    .bind(start)
-    .bind(end)
-    .fetch_all(pool)
-    .await?;
+    let sql = format!(
+        "SELECT bucket, {BYTE_COLUMNS}
+         FROM flow_stat_5m
+         WHERE addr = $1
+           AND bucket >= $2
+           AND bucket <  $3
+         ORDER BY bucket"
+    );
 
-    let found: HashMap<DateTime<Utc>, i64> = rows.into_iter().collect();
+    let rows: Vec<(DateTime<Utc>, i64, i64, i64, i64)> = sqlx::query_as(&sql)
+        .bind(ip)
+        .bind(start)
+        .bind(end)
+        .fetch_all(pool)
+        .await?;
+
+    let mut found: HashMap<DateTime<Utc>, Usage> = rows
+        .into_iter()
+        .map(|(bucket, ext_rx, ext_tx, intra_rx, intra_tx)| {
+            (bucket, Usage::new(ext_rx, ext_tx, intra_rx, intra_tx))
+        })
+        .collect();
 
     // 查當日時只補到現在所在的刻度：把尚未到來的時間也補成 0，圖表尾端
     // 會出現一段無法分辨「還沒發生」與「真的沒流量」的平坦區。
@@ -149,7 +162,7 @@ pub async fn daily_distribution(
         }
         points.push(BucketUsage {
             ts: to_taipei_rfc3339(ts),
-            bytes: found.get(&ts).copied().unwrap_or(0),
+            usage: found.remove(&ts).unwrap_or_else(Usage::zero),
         });
     }
 
@@ -161,40 +174,45 @@ pub async fn daily_distribution(
     })
 }
 
-/// 四、過量門檻檢查：當日用量超過門檻的所有 IP
+/// 四、過量門檻檢查：當日「對外合計」超過門檻的所有 IP
+///
+/// 門檻固定比對 `ext_rx_bytes + ext_tx_bytes`，不含校內流量。
 pub async fn exceeded(
     pool: &PgPool,
     day: NaiveDate,
     threshold_mib: f64,
     threshold_bytes: i64,
 ) -> ApiResult<ExceededReport> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        r#"
-        SELECT host(addr) AS ip,
-               ext_rx_bytes + ext_tx_bytes AS bytes
-        FROM flow_stat_1d
-        WHERE day = $1
-          AND ext_rx_bytes + ext_tx_bytes > $2
-        ORDER BY 2 DESC, 1 ASC
-        "#,
-    )
-    .bind(day)
-    .bind(threshold_bytes)
-    .fetch_all(pool)
-    .await?;
+    // 排序與篩選都寫成完整運算式，不用輸出欄位的序數（ORDER BY 2）：
+    // 欄位一增減，序數指到的東西就變了，而這種錯不會有任何錯誤訊息。
+    let sql = format!(
+        "SELECT host(addr) AS ip, {BYTE_COLUMNS}
+         FROM flow_stat_1d
+         WHERE day = $1
+           AND ext_rx_bytes + ext_tx_bytes > $2
+         ORDER BY ext_rx_bytes + ext_tx_bytes DESC, addr ASC"
+    );
 
-    // 同樣正規化成 Rust 的形式，讓這支端點吐出的 IP 字串能直接餵回
+    let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(&sql)
+        .bind(day)
+        .bind(threshold_bytes)
+        .fetch_all(pool)
+        .await?;
+
+    // 正規化成 Rust 的形式，讓這支端點吐出的 IP 字串能直接餵回
     // today 端點的 ?ip= 參數，不必擔心兩邊的寫法對不上。
     let results: Vec<IpUsage> = rows
         .into_iter()
-        .filter_map(|(text, bytes)| match text.parse::<IpAddr>() {
-            Ok(ip) => Some(IpUsage {
-                ip: ip.to_string(),
-                bytes,
-            }),
-            Err(_) => {
-                tracing::error!(addr = %text, "host(addr) returned an unparsable address");
-                None
+        .filter_map(|(text, ext_rx, ext_tx, intra_rx, intra_tx)| {
+            match text.parse::<IpAddr>() {
+                Ok(ip) => Some(IpUsage {
+                    ip: ip.to_string(),
+                    usage: Usage::new(ext_rx, ext_tx, intra_rx, intra_tx),
+                }),
+                Err(_) => {
+                    tracing::error!(addr = %text, "host(addr) returned an unparsable address");
+                    None
+                }
             }
         })
         .collect();

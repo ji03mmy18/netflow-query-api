@@ -5,11 +5,30 @@ Axum + Tokio + SQLx，連線 PostgreSQL / TimescaleDB。
 
 資料表定義見 [`sql/schema.sql`](sql/schema.sql)（由 collector 端負責建立與維護，本服務不做任何寫入）。
 
-## 用量定義
+## 用量欄位
 
-所有端點的 `bytes` 都是 **`ext_rx_bytes + ext_tx_bytes`**，即對外雙向流量合計。
+所有端點的用量都以同一組五個欄位回傳。回應的 JSON key 統一為 camelCase：
 
-不回傳 `intra_rx_bytes` / `intra_tx_bytes`，原因寫在 schema 註解裡：內網統計的母體只涵蓋經過核心交換器的流量（結構性不完整），而且兩端都在監控清單時同一份流量會同時計入雙方，加總出來的數字沒有意義。
+| 欄位 | 資料表欄位 | 方向 |
+|---|---|---|
+| `internetDownloadBytes` | `ext_rx_bytes` | 外網 → 本機 |
+| `internetUploadBytes` | `ext_tx_bytes` | 本機 → 外網 |
+| `internetTotalBytes` | — | `internetDownloadBytes + internetUploadBytes`，**不含校內流量** |
+| `schoolDownloadBytes` | `intra_rx_bytes` | 內網 → 本機 |
+| `schoolUploadBytes` | `intra_tx_bytes` | 本機 → 內網 |
+
+**方向是「受監控主機」的視角，不是交換器介面的視角。** 這兩種視角在網路工具裡都存在且方向相反，是經典的誤解來源——`internetDownloadBytes` 是該主機下載了多少，`internetUploadBytes` 是該主機上傳了多少。
+
+**`internetTotalBytes` 只計對外流量**（`internetDownloadBytes + internetUploadBytes`）。過量門檻檢查比對的就是這個數字。刻意不提供 `schoolTotalBytes`：校內流量跨主機不可加總，提供一個合計欄位只會鼓勵誤用。
+
+### school_* 的兩個限制
+
+`school*` 有 schema 註解點明的兩個語意限制，使用前務必理解：
+
+1. **母體結構性不完整。** 只涵蓋「經過核心交換器的內部流量」。在邊緣交換器就被 L3 轉發掉的部分完全不在其中。
+2. **跨主機不可加總。** 若一筆內部流量的兩端都在監控清單中，同一份流量會同時計入 A 的 `schoolUploadBytes` 與 B 的 `schoolDownloadBytes`。因此把多台主機的 `school*` 加起來，不等於實際內網流量。
+
+對外用量請一律使用 `internetDownloadBytes` / `internetUploadBytes` / `internetTotalBytes`。
 
 ## 快速開始
 
@@ -85,8 +104,22 @@ GET /api/v1/usage/today?ip=10.1.2.3,10.1.2.4      # 逗號分隔亦可
 {
   "date": "2026-09-18",
   "results": [
-    { "ip": "10.1.2.3", "bytes": 4823910233 },
-    { "ip": "10.1.2.4", "bytes": 0 }
+    {
+      "ip": "10.1.2.3",
+      "internetDownloadBytes": 4705537592,
+      "internetUploadBytes": 118372641,
+      "internetTotalBytes": 4823910233,
+      "schoolDownloadBytes": 82134901,
+      "schoolUploadBytes": 9927430
+    },
+    {
+      "ip": "10.1.2.4",
+      "internetDownloadBytes": 0,
+      "internetUploadBytes": 0,
+      "internetTotalBytes": 0,
+      "schoolDownloadBytes": 0,
+      "schoolUploadBytes": 0
+    }
   ]
 }
 ```
@@ -97,15 +130,28 @@ GET /api/v1/usage/today?ip=10.1.2.3,10.1.2.4      # 逗號分隔亦可
 GET /api/v1/usage/week?ip=10.1.2.3
 ```
 
-固定 7 筆，由舊到新（前六日 → 當日），缺漏日期補 0。
+固定 7 筆，由舊到新（前六日 → 當日），缺漏日期補 0。以下範例僅列出前兩筆。
 
 ```json
 {
   "ip": "10.1.2.3",
   "days": [
-    { "day": "2026-09-12", "bytes": 3201884112 },
-    { "day": "2026-09-13", "bytes": 0 },
-    { "day": "2026-09-18", "bytes": 4823910233 }
+    {
+      "day": "2026-09-12",
+      "internetDownloadBytes": 3102773301,
+      "internetUploadBytes": 99110811,
+      "internetTotalBytes": 3201884112,
+      "schoolDownloadBytes": 41028833,
+      "schoolUploadBytes": 5583920
+    },
+    {
+      "day": "2026-09-13",
+      "internetDownloadBytes": 0,
+      "internetUploadBytes": 0,
+      "internetTotalBytes": 0,
+      "schoolDownloadBytes": 0,
+      "schoolUploadBytes": 0
+    }
   ]
 }
 ```
@@ -117,7 +163,7 @@ GET /api/v1/usage/daily?ip=10.1.2.3&date=2026-09-17
 GET /api/v1/usage/daily?ip=10.1.2.3                 # date 省略 = 當日
 ```
 
-5 分鐘刻度，固定 288 筆（缺漏補 0）；查當日時只回到目前所在的刻度為止。
+5 分鐘刻度，固定 288 筆（缺漏補 0）；查當日時只回到目前所在的刻度為止。以下範例僅列出前兩筆。
 
 `flow_stat_5m` 有 retention policy，超出 `limits.distribution_max_age_days`（預設 395 天）的日期會回 `422`，而不是靜默回傳一整片 0。
 
@@ -125,10 +171,24 @@ GET /api/v1/usage/daily?ip=10.1.2.3                 # date 省略 = 當日
 {
   "ip": "10.1.2.3",
   "date": "2026-09-17",
-  "bucket_seconds": 300,
+  "bucketSeconds": 300,
   "points": [
-    { "ts": "2026-09-17T00:00:00+08:00", "bytes": 12043 },
-    { "ts": "2026-09-17T00:05:00+08:00", "bytes": 0 }
+    {
+      "ts": "2026-09-17T00:00:00+08:00",
+      "internetDownloadBytes": 11204,
+      "internetUploadBytes": 839,
+      "internetTotalBytes": 12043,
+      "schoolDownloadBytes": 0,
+      "schoolUploadBytes": 512
+    },
+    {
+      "ts": "2026-09-17T00:05:00+08:00",
+      "internetDownloadBytes": 0,
+      "internetUploadBytes": 0,
+      "internetTotalBytes": 0,
+      "schoolDownloadBytes": 0,
+      "schoolUploadBytes": 0
+    }
   ]
 }
 ```
@@ -137,19 +197,35 @@ GET /api/v1/usage/daily?ip=10.1.2.3                 # date 省略 = 當日
 
 ```
 GET /api/v1/usage/exceeded?threshold_mib=1024
+GET /api/v1/usage/exceeded?thresholdMib=1024      # 兩種寫法都接受
 ```
 
-回傳當日用量**超過**門檻的所有 IP，依用量由大到小排序。需要 API Key + 來源 IP 白名單。
+回傳當日 `internetTotalBytes`（對外合計）**超過**門檻的所有 IP，依 `internetTotalBytes` 由大到小排序。
+門檻固定比對對外流量，`school*` 不納入計算。需要 API Key + 來源 IP 白名單。
 
 ```json
 {
   "date": "2026-09-18",
-  "threshold_mib": 1024.0,
-  "threshold_bytes": 1073741824,
+  "thresholdMib": 1024.0,
+  "thresholdBytes": 1073741824,
   "count": 2,
   "results": [
-    { "ip": "10.1.2.3", "bytes": 4823910233 },
-    { "ip": "10.1.9.8", "bytes": 1174405120 }
+    {
+      "ip": "10.1.2.3",
+      "internetDownloadBytes": 4705537592,
+      "internetUploadBytes": 118372641,
+      "internetTotalBytes": 4823910233,
+      "schoolDownloadBytes": 82134901,
+      "schoolUploadBytes": 9927430
+    },
+    {
+      "ip": "10.1.9.8",
+      "internetDownloadBytes": 201338880,
+      "internetUploadBytes": 973066240,
+      "internetTotalBytes": 1174405120,
+      "schoolDownloadBytes": 0,
+      "schoolUploadBytes": 0
+    }
   ]
 }
 ```

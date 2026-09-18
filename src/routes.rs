@@ -113,6 +113,9 @@ async fn daily(
 
 #[derive(Debug, Deserialize)]
 struct ExceededParams {
+    /// 回應的 key 已是 camelCase（`thresholdMib`），查詢字串兩種寫法都收：
+    /// 只支援一種，必然會有人照著回應的欄位名去拼參數然後拿到 422。
+    #[serde(alias = "thresholdMib")]
     threshold_mib: f64,
 }
 
