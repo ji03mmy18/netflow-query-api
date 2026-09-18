@@ -127,7 +127,7 @@ pub async fn daily_distribution(
     now: DateTime<Utc>,
 ) -> ApiResult<DailyDistribution> {
     let (start, end) = day_bounds_utc(date)
-        .ok_or_else(|| crate::error::ApiError::validation(format!("{date} 不是合法的日期")))?;
+        .ok_or_else(|| crate::error::ApiError::validation(format!("{date} is not a valid date")))?;
 
     let sql = format!(
         "SELECT bucket, {BYTE_COLUMNS}

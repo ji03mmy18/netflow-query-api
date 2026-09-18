@@ -91,7 +91,7 @@ async fn daily(
 
     if date > today {
         return Err(ApiError::validation(format!(
-            "date {date} 是未來日期（今天是 {today}）"
+            "date {date} is in the future (today is {today})"
         )));
     }
 
@@ -102,8 +102,9 @@ async fn daily(
     let earliest = today - Duration::days(max_age);
     if date < earliest {
         return Err(ApiError::validation(format!(
-            "date {date} 超出 5 分鐘統計的保留範圍（最早 {earliest}）；\
-             該區間的原始分桶已被 retention policy 清除，僅日統計仍保留"
+            "date {date} is outside the retention window of the 5-minute statistics \
+             (earliest available: {earliest}); those buckets have been dropped by the \
+             retention policy, only daily totals remain"
         )));
     }
 
@@ -137,21 +138,21 @@ async fn exceeded(
             "threshold check requested but threshold_check.allowed_ips is empty"
         );
         return Err(ApiError::forbidden(
-            "門檻檢查端點未啟用：threshold_check.allowed_ips 為空",
+            "threshold check is disabled: threshold_check.allowed_ips is empty",
         ));
     }
 
     if !state.config.threshold_check_allows(client_ip) {
         tracing::warn!(key = %key.0, %client_ip, "threshold check rejected: source IP not allowed");
         return Err(ApiError::forbidden(format!(
-            "來源 IP {client_ip} 不在門檻檢查的允許名單內"
+            "source IP {client_ip} is not in the threshold check allow list"
         )));
     }
 
     let threshold_mib = params.threshold_mib;
     if !threshold_mib.is_finite() || threshold_mib < 0.0 {
         return Err(ApiError::validation(
-            "threshold_mib 必須是 0 或正的有限數值",
+            "threshold_mib must be a finite number greater than or equal to 0",
         ));
     }
 
@@ -159,7 +160,7 @@ async fn exceeded(
     // `as i64` 做飽和轉換更明確。
     let threshold_bytes = (threshold_mib * MIB).round();
     if threshold_bytes > i64::MAX as f64 {
-        return Err(ApiError::validation("threshold_mib 過大"));
+        return Err(ApiError::validation("threshold_mib is too large"));
     }
 
     tracing::info!(key = %key.0, %client_ip, threshold_mib, "threshold check");
@@ -184,7 +185,7 @@ fn parse_ips(raw: &[String], max: usize) -> ApiResult<Vec<IpAddr>> {
         }
         let ip: IpAddr = entry
             .parse()
-            .map_err(|_| ApiError::validation(format!("\"{entry}\" 不是合法的 IP 位址")))?;
+            .map_err(|_| ApiError::validation(format!("\"{entry}\" is not a valid IP address")))?;
 
         // 重複的 IP 只查一次：否則回應裡會出現同一個位址的多筆結果。
         if seen.insert(ip) {
@@ -193,11 +194,11 @@ fn parse_ips(raw: &[String], max: usize) -> ApiResult<Vec<IpAddr>> {
     }
 
     if ips.is_empty() {
-        return Err(ApiError::validation("至少需要一個 ip 參數"));
+        return Err(ApiError::validation("at least one ip parameter is required"));
     }
     if ips.len() > max {
         return Err(ApiError::validation(format!(
-            "單次最多查詢 {max} 個 IP，收到 {}",
+            "at most {max} IP addresses per request, received {}",
             ips.len()
         )));
     }
@@ -208,10 +209,10 @@ fn parse_ips(raw: &[String], max: usize) -> ApiResult<Vec<IpAddr>> {
 fn parse_single_ip(raw: &str) -> ApiResult<IpAddr> {
     raw.trim()
         .parse()
-        .map_err(|_| ApiError::validation(format!("\"{raw}\" 不是合法的 IP 位址")))
+        .map_err(|_| ApiError::validation(format!("\"{raw}\" is not a valid IP address")))
 }
 
 fn parse_date(raw: &str) -> ApiResult<NaiveDate> {
     NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
-        .map_err(|_| ApiError::validation(format!("date \"{raw}\" 必須是 YYYY-MM-DD 格式")))
+        .map_err(|_| ApiError::validation(format!("date \"{raw}\" must be in YYYY-MM-DD format")))
 }

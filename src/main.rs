@@ -41,18 +41,18 @@ async fn main() {
     let cli = Cli::parse();
 
     // 檢查模式沒有在啟動任何東西，錯誤前綴要跟著換，否則
-    // `--check-config` 失敗時印「啟動失敗」會讓人以為服務試圖啟動過。
+    // `--check-config` 失敗時印 "startup failed" 會讓人以為服務試圖啟動過。
     let (label, result) = if cli.check_config {
-        ("檢查失敗", check(&cli).await)
+        ("check failed", check(&cli).await)
     } else {
-        ("啟動失敗", serve(&cli).await)
+        ("startup failed", serve(&cli).await)
     };
 
     if let Err(error) = result {
-        eprintln!("{label}：{error}");
+        eprintln!("{label}: {error}");
         let mut source = error.source();
         while let Some(cause) = source {
-            eprintln!("  原因：{cause}");
+            eprintln!("  caused by: {cause}");
             source = cause.source();
         }
         std::process::exit(1);
@@ -71,7 +71,7 @@ async fn check(cli: &Cli) -> Result<(), BoxError> {
         let db = &config.config.database;
         let pool = db::connect(db).await.map_err(|error| {
             format!(
-                "無法連線資料庫 {}:{}/{}（user={}）：{error}",
+                "cannot connect to database {}:{}/{} (user={}): {error}",
                 db.host, db.port, db.name, db.user
             )
         })?;
@@ -81,11 +81,11 @@ async fn check(cli: &Cli) -> Result<(), BoxError> {
         let version: String = sqlx::query_scalar("SELECT version()")
             .fetch_one(&pool)
             .await
-            .map_err(|error| format!("連線已建立，但查詢失敗：{error}"))?;
+            .map_err(|error| format!("connected, but the test query failed: {error}"))?;
         pool.close().await;
 
         println!();
-        println!("資料庫連線檢查通過");
+        println!("database connection OK");
         println!("  {version}");
     }
 
@@ -117,7 +117,7 @@ async fn serve(cli: &Cli) -> Result<(), BoxError> {
     let db = &config.config.database;
     let pool = db::connect(db).await.map_err(|error| {
         format!(
-            "無法連線資料庫 {}:{}/{}（user={}）：{error}",
+            "cannot connect to database {}:{}/{} (user={}): {error}",
             db.host, db.port, db.name, db.user
         )
     })?;
@@ -153,10 +153,10 @@ async fn serve(cli: &Cli) -> Result<(), BoxError> {
 fn load_config(path: &Path) -> Result<LoadedConfig, BoxError> {
     if !path.exists() {
         return Err(format!(
-            "找不到設定檔 {}\n\n\
-             提示：複製範本後填入資料庫連線與 API Key：\n    \
+            "config file not found: {}\n\n\
+             hint: copy the template, then fill in the database credentials and API keys:\n    \
              cp config.example.toml {}\n\n\
-             或用 --config 指定其他路徑（見 --help）",
+             or point --config at another path (see --help)",
             path.display(),
             path.display()
         )
@@ -171,52 +171,53 @@ fn print_config_summary(path: &Path, config: &LoadedConfig) {
     let key_names: Vec<&str> = c.auth.keys.iter().map(|k| k.name.as_str()).collect();
 
     let proxies = if config.trusted_proxies.is_empty() {
-        "無（一律以 TCP 對端 IP 為準）".to_string()
+        "none (client IP is always the TCP peer address)".to_string()
     } else {
-        config
-            .trusted_proxies
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        join_networks(&config.trusted_proxies)
     };
 
     let threshold = if config.threshold_allowed_ips.is_empty() {
-        "無 → 門檻檢查端點停用".to_string()
+        "none - /api/v1/usage/exceeded is disabled".to_string()
     } else {
-        config
-            .threshold_allowed_ips
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        join_networks(&config.threshold_allowed_ips)
     };
 
-    println!("設定檔 {} 檢查通過", path.display());
-    println!("  監聽位址        {}:{}", c.server.host, c.server.port);
+    // 欄寬固定，讓值在終端裡對齊成一欄，掃視時比較容易發現寫錯的那一行。
+    const W: usize = 20;
+
+    println!("config {} is valid", path.display());
+    println!("  {:<W$}{}:{}", "listen", c.server.host, c.server.port);
     println!(
-        "  資料庫          {}:{}/{}（user={}, max_connections={}）",
-        c.database.host, c.database.port, c.database.name, c.database.user, c.database.max_connections
+        "  {:<W$}{}:{}/{} (user={}, max_connections={})",
+        "database", c.database.host, c.database.port, c.database.name, c.database.user,
+        c.database.max_connections
     );
-    println!("  API Key         {} 把：{}", key_names.len(), key_names.join(", "));
-    println!("  受信任代理      {proxies}");
-    println!("  門檻檢查來源    {threshold}");
-    println!("  單次 IP 上限    {}", c.limits.max_ips_per_request);
     println!(
-        "  分佈回溯上限    {} 天",
-        c.limits.distribution_max_age_days
+        "  {:<W$}{} configured: {}",
+        "api keys",
+        key_names.len(),
+        key_names.join(", ")
+    );
+    println!("  {:<W$}{proxies}", "trusted proxies");
+    println!("  {:<W$}{threshold}", "threshold sources");
+    println!(
+        "  {:<W$}{}",
+        "max ips per request", c.limits.max_ips_per_request
+    );
+    println!(
+        "  {:<W$}{} days",
+        "distribution window", c.limits.distribution_max_age_days
     );
 }
 
-/// 等待關機訊號。
-///
-/// SIGINT 與 SIGTERM 都要收：前者是終端上的 Ctrl-C，後者是 `systemctl stop`
-/// 與容器執行期實際送出的訊號。只收 SIGINT 的話，服務在 systemd 底下會被
-/// 預設處置直接終止，graceful shutdown 完全不會執行——而且看起來一切正常，
-/// 因為程序確實結束了。
-///
-/// 訊號處理器安裝失敗時改為永久等待，而不是直接返回：返回會被上層當成
-/// 「收到關機訊號」，服務會在啟動後立刻自己關掉。
+fn join_networks(networks: &[ipnetwork::IpNetwork]) -> String {
+    networks
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 

@@ -10,7 +10,7 @@ use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
-    #[error("API Key 無效或未提供")]
+    #[error("missing or invalid API key")]
     Unauthorized,
 
     #[error("{0}")]
@@ -19,7 +19,7 @@ pub enum ApiError {
     #[error("{0}")]
     Validation(String),
 
-    #[error("資料庫查詢失敗")]
+    #[error("database query failed")]
     Database(#[from] sqlx::Error),
 }
 

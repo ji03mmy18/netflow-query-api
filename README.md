@@ -46,28 +46,48 @@ cp config.example.toml config.toml            # 修改資料庫連線與 API Key
 Usage: netflow-query-api [OPTIONS]
 
 Options:
-  -c, --config <PATH>  設定檔路徑 [default: config.toml]
-      --check-config   只驗證設定檔後結束，不連線資料庫、不監聽埠號
-      --check-dbconn   連同資料庫連線一起驗證（須搭配 --check-config）
+  -c, --config <PATH>  Path to the configuration file [default: config.toml]
+      --check-config   Validate the configuration file and exit; does not connect to the database or bind a port
+      --check-dbconn   Also verify the database connection (requires --check-config)
   -h, --help           Print help (see more with '--help')
   -V, --version        Print version
 ```
 
+**所有對外文字一律英文**（`--help`、啟動訊息、`--check-config` 報告，以及 HTTP
+回應的 `error.message`）。
+原因是 journald 在非 UTF-8 locale 下——伺服器上常見的 `LANG=C`——會把非 ASCII
+位元組逐一轉義成 `\xNN`，中文訊息在 `journalctl` 裡會完全無法閱讀。設定 locale
+可以繞過，但日誌不該依賴目標機器的 locale 設定才看得懂。
+
+（原始碼的註解仍是中文；那是給維護者看的，不會出現在輸出裡。）
+
 `--check-config` 會印出解析後的設定摘要並以結束碼表示結果（0 = 通過），
-適合放進部署腳本。它印的是**實際生效的值**，不是設定檔的原文——例如
-白名單裡寫 `10.0.0.5` 會顯示為 `10.0.0.5/32`，`threshold_check.allowed_ips`
-留空會直接標示「門檻檢查端點停用」。
+適合放進部署腳本。它印的是**實際生效的值**，不是設定檔的原文——例如白名單裡
+寫 `10.0.0.5` 會顯示為 `10.0.0.5/32`，`threshold_check.allowed_ips` 留空會直接
+標示該端點已停用。
 
 ```
 $ netflow-query-api --check-config
-設定檔 config.toml 檢查通過
-  監聽位址        0.0.0.0:8081
-  資料庫          localhost:5432/netflow（user=netflow_ro, max_connections=5）
-  API Key         2 把：dashboard, monitor
-  受信任代理      無（一律以 TCP 對端 IP 為準）
-  門檻檢查來源    10.0.0.5/32, 192.168.1.0/24
-  單次 IP 上限    50
-  分佈回溯上限    395 天
+config config.toml is valid
+  listen              0.0.0.0:8081
+  database            db.example.edu.tw:5432/netflow (user=netflow_ro, max_connections=5)
+  api keys            2 configured: dashboard, monitor
+  trusted proxies     none (client IP is always the TCP peer address)
+  threshold sources   none - /api/v1/usage/exceeded is disabled
+  max ips per request 50
+  distribution window 395 days
+```
+
+失敗時訊息會走完整個 source chain：
+
+```
+$ netflow-query-api --check-config
+check failed: config file not found: config.toml
+
+hint: copy the template, then fill in the database credentials and API keys:
+    cp config.example.toml config.toml
+
+or point --config at another path (see --help)
 ```
 
 `--check-dbconn` 必須搭配 `--check-config`，會在設定檢查通過後實際連一次
@@ -233,7 +253,7 @@ GET /api/v1/usage/exceeded?thresholdMib=1024      # 兩種寫法都接受
 ## 錯誤格式
 
 ```json
-{ "error": { "code": "VALIDATION_ERROR", "message": "..." } }
+{ "error": { "code": "VALIDATION_ERROR", "message": "\"10.1.2.300\" is not a valid IP address" } }
 ```
 
 | code | HTTP |

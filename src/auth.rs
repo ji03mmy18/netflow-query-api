@@ -67,7 +67,7 @@ impl FromRequestParts<AppState> for ClientIp {
                 // 只會在 server 未以 into_make_service_with_connect_info 啟動時發生。
                 // 這種情況下無法判斷來源，一律拒絕而不是放行。
                 tracing::error!("ConnectInfo missing; cannot determine client IP");
-                ApiError::forbidden("伺服器無法判斷請求來源 IP")
+                ApiError::forbidden("the server could not determine the client IP address")
             })?;
 
         if !state.config.is_trusted_proxy(peer) {

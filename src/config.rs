@@ -159,18 +159,18 @@ fn parse_networks(raw: &[String], field: &str) -> Result<Vec<IpNetwork>, ConfigE
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("無法讀取設定檔 {path}")]
+    #[error("cannot read config file {path}")]
     Read {
         path: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("設定檔格式錯誤: {0}")]
+    #[error("invalid config file syntax: {0}")]
     Parse(#[from] toml::de::Error),
-    #[error("auth.keys 不可為空，至少要有一把 API Key")]
+    #[error("auth.keys must not be empty; at least one API key is required")]
     NoApiKeys,
-    #[error("API Key \"{0}\" 的 key 欄位為空")]
+    #[error("API key \"{0}\" has an empty key field")]
     EmptyApiKey(String),
-    #[error("{field} 中的 \"{value}\" 不是合法的 IP 或 CIDR")]
+    #[error("{field}: \"{value}\" is not a valid IP address or CIDR")]
     BadNetwork { field: String, value: String },
 }
