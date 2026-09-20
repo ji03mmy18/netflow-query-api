@@ -123,6 +123,51 @@ pub struct BucketUsage {
     pub usage: Usage,
 }
 
+pub const MIB: i64 = 1024 * 1024;
+pub const GIB: i64 = 1024 * MIB;
+
+/// 四、過量門檻檢查的一列。
+///
+/// 比 [`IpUsage`] 多了「超標多少」。三個 `overThreshold*` 是同一個數字的
+/// 三種表示，`overThresholdBytes` 是權威值，另外兩個是方便閱讀的換算。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExceededEntry {
+    pub ip: String,
+    #[serde(flatten)]
+    pub usage: Usage,
+    /// `internetTotalBytes - thresholdBytes`
+    pub over_threshold_bytes: i64,
+    /// 同上，換算為 MiB 後**無條件捨去**。
+    ///
+    /// ⚠ 剛好超標一點點時這裡會是 0（例如超標 500 KB）。這不是錯誤——
+    /// 0 的讀法是「不到一個完整單位」，精確值一律看 `overThresholdBytes`。
+    pub over_threshold_mib: i64,
+    /// 同上，換算為 GiB 後無條件捨去。門檻若設在 GiB 等級，這個欄位
+    /// 多數時候會是 0，只有超標超過 1 GiB 才看得到非零值。
+    pub over_threshold_gib: i64,
+}
+
+impl ExceededEntry {
+    pub fn new(ip: String, usage: Usage, threshold_bytes: i64) -> Self {
+        // SQL 已經濾掉未超標的列，理論上恆為正；仍用 saturating + max(0)
+        // 收尾，避免日後有人改了篩選條件卻忘了這裡會變成負數。
+        let over = usage
+            .internet_total_bytes
+            .saturating_sub(threshold_bytes)
+            .max(0);
+
+        Self {
+            ip,
+            usage,
+            over_threshold_bytes: over,
+            // over >= 0，整數除法即為 floor。
+            over_threshold_mib: over / MIB,
+            over_threshold_gib: over / GIB,
+        }
+    }
+}
+
 /// 四、過量門檻檢查
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,7 +177,7 @@ pub struct ExceededReport {
     pub threshold_bytes: i64,
     pub count: usize,
     /// 依 `internetTotalBytes` 由大到小排序
-    pub results: Vec<IpUsage>,
+    pub results: Vec<ExceededEntry>,
 }
 
 #[cfg(test)]
@@ -212,8 +257,12 @@ mod tests {
             date: "2026-09-18".to_string(),
             threshold_mib: 1024.0,
             threshold_bytes: 1_073_741_824,
-            count: 0,
-            results: vec![],
+            count: 1,
+            results: vec![ExceededEntry::new(
+                "10.1.2.3".to_string(),
+                Usage::new(4_705_537_592, 118_372_641, 0, 0),
+                1_073_741_824,
+            )],
         })
         .unwrap();
 
@@ -233,6 +282,73 @@ mod tests {
         // 順手釘住兩個原本是 snake_case 的 key
         assert_eq!(distribution["bucketSeconds"], 300);
         assert_eq!(report["thresholdBytes"], 1_073_741_824i64);
+    }
+
+    #[test]
+    fn exceeded_entry_computes_overage() {
+        // 門檻 1024 MiB，用量 4823910233 bytes
+        let entry = ExceededEntry::new(
+            "10.1.2.3".to_string(),
+            Usage::new(4_705_537_592, 118_372_641, 0, 0),
+            1_073_741_824,
+        );
+
+        assert_eq!(entry.usage.internet_total_bytes, 4_823_910_233);
+        assert_eq!(entry.over_threshold_bytes, 3_750_168_409);
+        assert_eq!(entry.over_threshold_mib, 3_576);
+        assert_eq!(entry.over_threshold_gib, 3);
+    }
+
+    /// 剛好超標一點點時，MiB 與 GiB 無條件捨去後都是 0。
+    /// 這是 floor 的必然結果——0 的讀法是「不到一個完整單位」，
+    /// 精確值看 overThresholdBytes。
+    #[test]
+    fn exceeded_entry_floors_partial_units_to_zero() {
+        let threshold = 1_073_741_824; // 1 GiB
+        let entry = ExceededEntry::new(
+            "10.1.2.4".to_string(),
+            Usage::new(threshold + 524_288, 0, 0, 0), // 超標 512 KiB
+            threshold,
+        );
+
+        assert_eq!(entry.over_threshold_bytes, 524_288);
+        assert_eq!(entry.over_threshold_mib, 0);
+        assert_eq!(entry.over_threshold_gib, 0);
+    }
+
+    /// SQL 已濾掉未超標的列，但這裡不該因為上游改動就吐出負數。
+    #[test]
+    fn exceeded_entry_never_reports_negative_overage() {
+        let entry = ExceededEntry::new("10.1.2.5".to_string(), Usage::new(10, 0, 0, 0), 1_000);
+
+        assert_eq!(entry.over_threshold_bytes, 0);
+        assert_eq!(entry.over_threshold_mib, 0);
+        assert_eq!(entry.over_threshold_gib, 0);
+    }
+
+    #[test]
+    fn exceeded_entry_serialises_flat() {
+        let value = serde_json::to_value(ExceededEntry::new(
+            "10.1.2.3".to_string(),
+            Usage::new(100, 20, 7, 3),
+            50,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "ip": "10.1.2.3",
+                "internetDownloadBytes": 100,
+                "internetUploadBytes": 20,
+                "internetTotalBytes": 120,
+                "schoolDownloadBytes": 7,
+                "schoolUploadBytes": 3,
+                "overThresholdBytes": 70,
+                "overThresholdMib": 0,
+                "overThresholdGib": 0,
+            })
+        );
     }
 
     fn assert_no_underscores(value: &serde_json::Value) {

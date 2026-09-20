@@ -103,7 +103,15 @@ impl LoadedConfig {
             path: path.display().to_string(),
             source,
         })?;
-        let config: Config = toml::from_str(&text)?;
+        Self::from_toml_str(&text)
+    }
+
+    /// 與 [`load`](Self::load) 相同，但來源是字串。
+    ///
+    /// 抽出來是為了讓測試不必落地一個暫存檔——驗證邏輯（空 keys、
+    /// 壞掉的 CIDR）全在這裡，落在檔案讀取之後。
+    pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
+        let config: Config = toml::from_str(text)?;
 
         if config.auth.keys.is_empty() {
             return Err(ConfigError::NoApiKeys);

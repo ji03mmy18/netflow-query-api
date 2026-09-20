@@ -126,6 +126,9 @@ async fn serve(cli: &Cli) -> Result<(), BoxError> {
     let addr: SocketAddr = format!("{}:{}", config.config.server.host, config.config.server.port)
         .parse()?;
 
+    // `Router::layer` 後加的在外層，所以 TraceLayer 是最外層，包住
+    // routes::router() 內部的 CompressionLayer。這樣日誌記錄到的是實際
+    // 送出去的回應（含 content-encoding），而不是壓縮前的樣子。
     let app = routes::router(AppState {
         pool: pool.clone(),
         config: Arc::clone(&config),

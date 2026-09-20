@@ -17,7 +17,8 @@ use sqlx::PgPool;
 
 use crate::error::ApiResult;
 use crate::models::{
-    BucketUsage, DailyDistribution, DayUsage, ExceededReport, IpUsage, TodayUsage, Usage, WeekUsage,
+    BucketUsage, DailyDistribution, DayUsage, ExceededEntry, ExceededReport, IpUsage, TodayUsage,
+    Usage, WeekUsage,
 };
 use crate::timeutil::{BUCKETS_PER_DAY, BUCKET_SECONDS, day_bounds_utc, to_taipei_rfc3339};
 
@@ -201,14 +202,15 @@ pub async fn exceeded(
 
     // 正規化成 Rust 的形式，讓這支端點吐出的 IP 字串能直接餵回
     // today 端點的 ?ip= 參數，不必擔心兩邊的寫法對不上。
-    let results: Vec<IpUsage> = rows
+    let results: Vec<ExceededEntry> = rows
         .into_iter()
         .filter_map(|(text, ext_rx, ext_tx, intra_rx, intra_tx)| {
             match text.parse::<IpAddr>() {
-                Ok(ip) => Some(IpUsage {
-                    ip: ip.to_string(),
-                    usage: Usage::new(ext_rx, ext_tx, intra_rx, intra_tx),
-                }),
+                Ok(ip) => Some(ExceededEntry::new(
+                    ip.to_string(),
+                    Usage::new(ext_rx, ext_tx, intra_rx, intra_tx),
+                    threshold_bytes,
+                )),
                 Err(_) => {
                     tracing::error!(addr = %text, "host(addr) returned an unparsable address");
                     None

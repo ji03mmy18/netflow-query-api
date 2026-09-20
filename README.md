@@ -108,6 +108,29 @@ X-API-Key: <config.toml 中 auth.keys 的某一把>
 
 若服務跑在反向代理後面，必須把代理的位址填進 `auth.trusted_proxies`，否則來源 IP 會被判定為代理自己的 IP。反之，**不要**把不受你控制的來源放進 `trusted_proxies`——那等於允許對方用 `X-Forwarded-For` 偽造自己的 IP。
 
+## 壓縮
+
+回應支援 gzip。呼叫端送出 `Accept-Encoding: gzip` 就會拿到壓縮後的內容，
+沒送則原樣回傳——不支援壓縮的呼叫端不需要任何改動。
+
+```sh
+curl -H "X-API-Key: $KEY" -H "Accept-Encoding: gzip" --compressed \
+  "http://127.0.0.1:8081/api/v1/usage/daily?ip=10.1.2.3"
+```
+
+實測壓縮比（以相同結構的代表性資料量測）：
+
+| 回應 | 原始 | gzip | 比例 |
+|---|---|---|---|
+| `/usage/daily`（288 點） | 51.6 KB | 8.5 KB | 6.1x |
+| `/usage/exceeded`（200 列） | 48.7 KB | 9.2 KB | 5.3x |
+
+小於 32 bytes 的回應不壓縮（那種大小壓了只會變大），`/healthz` 因此一律是純文字。
+
+壓縮層定義在 [`routes::router()`](src/routes.rs) 而非 `main`，這樣測試組出的
+app 與正式啟動的是同一份設定；`TraceLayer` 留在 `main` 並包在最外層，
+讓日誌記錄到的是實際送出的回應。
+
 ## 端點
 
 ### 1. 當日用量查詢
@@ -223,6 +246,18 @@ GET /api/v1/usage/exceeded?thresholdMib=1024      # 兩種寫法都接受
 回傳當日 `internetTotalBytes`（對外合計）**超過**門檻的所有 IP，依 `internetTotalBytes` 由大到小排序。
 門檻固定比對對外流量，`school*` 不納入計算。需要 API Key + 來源 IP 白名單。
 
+每一列除了共用的用量欄位，另外帶三個「超標多少」的欄位：
+
+| 欄位 | 說明 |
+|---|---|
+| `overThresholdBytes` | `internetTotalBytes - thresholdBytes`，權威值 |
+| `overThresholdMib` | 同上換算 MiB，**無條件捨去** |
+| `overThresholdGib` | 同上換算 GiB，**無條件捨去** |
+
+⚠ 捨去後可能是 `0`：一台超標 512 KiB 的主機，`overThresholdMib` 與 `overThresholdGib`
+都會是 `0`。這不是錯誤——`0` 的讀法是「不到一個完整單位」，精確值一律看
+`overThresholdBytes`。門檻若設在 GiB 等級，`overThresholdGib` 多數時候都會是 0。
+
 ```json
 {
   "date": "2026-09-18",
@@ -236,7 +271,10 @@ GET /api/v1/usage/exceeded?thresholdMib=1024      # 兩種寫法都接受
       "internetUploadBytes": 118372641,
       "internetTotalBytes": 4823910233,
       "schoolDownloadBytes": 82134901,
-      "schoolUploadBytes": 9927430
+      "schoolUploadBytes": 9927430,
+      "overThresholdBytes": 3750168409,
+      "overThresholdMib": 3576,
+      "overThresholdGib": 3
     },
     {
       "ip": "10.1.9.8",
@@ -244,7 +282,10 @@ GET /api/v1/usage/exceeded?thresholdMib=1024      # 兩種寫法都接受
       "internetUploadBytes": 973066240,
       "internetTotalBytes": 1174405120,
       "schoolDownloadBytes": 0,
-      "schoolUploadBytes": 0
+      "schoolUploadBytes": 0,
+      "overThresholdBytes": 100663296,
+      "overThresholdMib": 96,
+      "overThresholdGib": 0
     }
   ]
 }

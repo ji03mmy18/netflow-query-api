@@ -9,6 +9,7 @@ use axum::{Json, Router};
 use axum_extra::extract::Query;
 use chrono::{Duration, NaiveDate, Utc};
 use serde::Deserialize;
+use tower_http::compression::CompressionLayer;
 
 use crate::auth::{AuthenticatedKey, ClientIp};
 use crate::error::{ApiError, ApiResult};
@@ -19,6 +20,12 @@ use crate::timeutil::today_taipei;
 
 const MIB: f64 = 1_048_576.0;
 
+/// 組裝路由與應用層中介層。
+///
+/// CompressionLayer 放在這裡而不是 main：測試若要自己重建一次中介層堆疊，
+/// 就會變成「測試通過但正式啟動的設定不同」——壓縮相關的行為必須以同一
+/// 個組裝結果為準。TraceLayer 留在 main，它是觀測設定而非應用行為，且要
+/// 在最外層才能記錄到實際送出的回應。
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -27,6 +34,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/usage/daily", get(daily))
         .route("/api/v1/usage/exceeded", get(exceeded))
         .with_state(state)
+        // 只在請求帶 Accept-Encoding: gzip 時才壓縮；沒帶就原樣回傳，
+        // 因此不會影響任何既有呼叫端。預設跳過小於 32 bytes 的回應——
+        // 壓縮那種大小的內容只會變大。
+        .layer(CompressionLayer::new())
 }
 
 /// 存活探測，刻意不驗 API Key，也刻意不碰資料庫：它回答的是「這個
@@ -215,4 +226,208 @@ fn parse_single_ip(raw: &str) -> ApiResult<IpAddr> {
 fn parse_date(raw: &str) -> ApiResult<NaiveDate> {
     NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
         .map_err(|_| ApiError::validation(format!("date \"{raw}\" must be in YYYY-MM-DD format")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode, header};
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::config::LoadedConfig;
+
+    const API_KEY: &str = "test-key";
+
+    const CONFIG: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 8081
+
+[database]
+host = "127.0.0.1"
+port = 5432
+name = "netflow"
+user = "netflow_ro"
+password = "x"
+
+[[auth.keys]]
+name = "dashboard"
+key = "test-key"
+"#;
+
+    /// 組出真正的 router，但 pool 用 `connect_lazy_with`——它不會建立任何
+    /// 連線，所以不需要資料庫就能測試整條中介層堆疊。
+    ///
+    /// 條件是測試請求不能走到查詢：認證失敗、參數驗證失敗、門檻端點的
+    /// 來源 IP 檢查、healthz 都在碰資料庫之前就回應了。
+    fn app() -> Router {
+        let config = LoadedConfig::from_toml_str(CONFIG).expect("test config should be valid");
+        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        router(AppState {
+            pool,
+            config: Arc::new(config),
+        })
+    }
+
+    fn request(uri: &str) -> axum::http::request::Builder {
+        Request::builder().uri(uri)
+    }
+
+    async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn healthz_needs_no_api_key() {
+        let response = app()
+            .oneshot(request("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn missing_api_key_is_rejected() {
+        let response = app()
+            .oneshot(
+                request("/api/v1/usage/today?ip=10.1.2.3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_api_key_is_rejected() {
+        let response = app()
+            .oneshot(
+                request("/api/v1/usage/today?ip=10.1.2.3")
+                    .header(crate::auth::API_KEY_HEADER, "not-the-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn invalid_ip_is_rejected_before_touching_the_database() {
+        let response = app()
+            .oneshot(
+                request("/api/v1/usage/today?ip=not-an-ip")
+                    .header(crate::auth::API_KEY_HEADER, API_KEY)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// 門檻端點在 `threshold_check.allowed_ips` 為空時必須一律拒絕
+    /// （fail-closed）。漏設定的後果應該是查不到，而不是全開。
+    #[tokio::test]
+    async fn threshold_endpoint_is_closed_when_allow_list_is_empty() {
+        let mut req = request("/api/v1/usage/exceeded?threshold_mib=1")
+            .header(crate::auth::API_KEY_HEADER, API_KEY)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+
+        let response = app().oneshot(req).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// 帶 Accept-Encoding: gzip 時回應要被壓縮，且解開後與未壓縮版本相同。
+    #[tokio::test]
+    async fn gzip_is_applied_when_requested() {
+        let uri = "/api/v1/usage/today?ip=not-an-ip";
+
+        let plain = app()
+            .oneshot(
+                request(uri)
+                    .header(crate::auth::API_KEY_HEADER, API_KEY)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let plain_body = body_bytes(plain).await;
+
+        let compressed = app()
+            .oneshot(
+                request(uri)
+                    .header(crate::auth::API_KEY_HEADER, API_KEY)
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            compressed
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .map(|v| v.to_str().unwrap()),
+            Some("gzip"),
+            "帶 Accept-Encoding: gzip 卻沒有壓縮"
+        );
+
+        let raw = body_bytes(compressed).await;
+        assert_ne!(raw, plain_body, "標示為 gzip 但內容未經壓縮");
+
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(&raw[..])
+            .read_to_end(&mut decoded)
+            .expect("gzip body should decode");
+
+        assert_eq!(decoded, plain_body, "解壓後的內容與未壓縮版本不一致");
+    }
+
+    /// 沒有 Accept-Encoding 時必須原樣回傳。
+    /// 這是「不支援壓縮的呼叫端照樣能用」的保證。
+    #[tokio::test]
+    async fn no_compression_without_accept_encoding() {
+        let response = app()
+            .oneshot(
+                request("/api/v1/usage/today?ip=not-an-ip")
+                    .header(crate::auth::API_KEY_HEADER, API_KEY)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.headers().get(header::CONTENT_ENCODING).is_none(),
+            "未要求壓縮卻回了 content-encoding"
+        );
+
+        let body = body_bytes(response).await;
+        let text = String::from_utf8(body).expect("body should be UTF-8");
+        assert!(
+            text.starts_with('{') && text.contains("VALIDATION_ERROR"),
+            "未壓縮的回應應該是可直接閱讀的 JSON，實際為：{text}"
+        );
+    }
 }

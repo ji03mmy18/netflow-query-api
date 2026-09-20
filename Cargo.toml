@@ -21,10 +21,16 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 chrono-tz = "0.10"
 ipnetwork = "0.20"
 toml = "0.8"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "compression-gzip"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+
+[dev-dependencies]
+# oneshot()：不啟動伺服器就能對 router 發請求
+tower = { version = "0.5", features = ["util"] }
+# 驗證 gzip 回應真的解得開（已在相依樹中，tower-http 的壓縮就是用它）
+flate2 = "1"
 
 [profile.release]
 # 移除符號表：這個執行檔是要放上 Release 供人下載的，符號表對使用者
