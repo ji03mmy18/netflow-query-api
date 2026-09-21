@@ -108,6 +108,11 @@ async fn serve(cli: &Cli) -> Result<(), BoxError> {
             "threshold_check.allowed_ips is empty; GET /api/v1/usage/exceeded will reject all requests"
         );
     }
+    if !config.top_n_enabled() {
+        tracing::warn!(
+            "top_n.allowed_ips is empty; GET /api/v1/usage/top will reject all requests"
+        );
+    }
     if config.trusted_proxies.is_empty() {
         tracing::info!("no trusted proxies configured; client IP is always the TCP peer address");
     }
@@ -185,6 +190,12 @@ fn print_config_summary(path: &Path, config: &LoadedConfig) {
         join_networks(&config.threshold_allowed_ips)
     };
 
+    let top_n = if config.top_n_allowed_ips.is_empty() {
+        "none - /api/v1/usage/top is disabled".to_string()
+    } else {
+        join_networks(&config.top_n_allowed_ips)
+    };
+
     // 欄寬固定，讓值在終端裡對齊成一欄，掃視時比較容易發現寫錯的那一行。
     const W: usize = 20;
 
@@ -203,6 +214,7 @@ fn print_config_summary(path: &Path, config: &LoadedConfig) {
     );
     println!("  {:<W$}{proxies}", "trusted proxies");
     println!("  {:<W$}{threshold}", "threshold sources");
+    println!("  {:<W$}{top_n}", "top-n sources");
     println!(
         "  {:<W$}{}",
         "max ips per request", c.limits.max_ips_per_request
@@ -210,6 +222,10 @@ fn print_config_summary(path: &Path, config: &LoadedConfig) {
     println!(
         "  {:<W$}{} days",
         "distribution window", c.limits.distribution_max_age_days
+    );
+    println!(
+        "  {:<W$}default {}, max {}",
+        "top-n limit", c.limits.top_n_default_limit, c.limits.top_n_max_limit
     );
 }
 

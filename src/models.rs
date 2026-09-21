@@ -123,6 +123,19 @@ pub struct BucketUsage {
     pub usage: Usage,
 }
 
+/// 五、Top-N 用量排行
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopUsage {
+    pub date: String,
+    /// 實際生效的筆數上限（呼叫端未指定時為設定檔的預設值）
+    pub limit: usize,
+    /// 實際回傳的筆數。當日有對外流量的主機不足 `limit` 時會小於 `limit`。
+    pub count: usize,
+    /// 依 `internetTotalBytes` 由大到小排序
+    pub results: Vec<IpUsage>,
+}
+
 pub const MIB: i64 = 1024 * 1024;
 pub const GIB: i64 = 1024 * MIB;
 

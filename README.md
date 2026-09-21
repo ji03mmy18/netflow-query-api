@@ -104,7 +104,15 @@ X-API-Key: <config.toml 中 auth.keys 的某一把>
 
 `/healthz` 不需要認證。
 
-`GET /api/v1/usage/exceeded` 額外要求來源 IP 落在 `[threshold_check].allowed_ips`；該陣列為空時端點一律拒絕（fail-closed）。
+兩支會**列舉 IP 位址**的端點，除了 API Key 之外還要求來源 IP 落在各自的白名單。
+陣列為空時該端點一律拒絕（fail-closed）——漏設定的後果是查不到，而不是全開。
+
+| 端點 | 白名單 |
+|---|---|
+| `GET /api/v1/usage/exceeded` | `[threshold_check].allowed_ips` |
+| `GET /api/v1/usage/top` | `[top_n].allowed_ips` |
+
+兩份白名單獨立，可以分別開關；設了其中一支不會解鎖另一支。
 
 若服務跑在反向代理後面，必須把代理的位址填進 `auth.trusted_proxies`，否則來源 IP 會被判定為代理自己的 IP。反之，**不要**把不受你控制的來源放進 `trusted_proxies`——那等於允許對方用 `X-Forwarded-For` 偽造自己的 IP。
 
@@ -298,6 +306,52 @@ GET /api/v1/usage/exceeded?thresholdMib=1024                   # 門檻參數兩
       "overThresholdBytes": 100663296,
       "overThresholdMib": 96,
       "overThresholdGib": 0
+    }
+  ]
+}
+```
+
+### 5. Top-N 用量排行
+
+```
+GET /api/v1/usage/top                             # 當日前 20 名
+GET /api/v1/usage/top?limit=50                    # 前 50 名
+GET /api/v1/usage/top?limit=50&date=2026-09-15    # 指定日期
+```
+
+| 參數 | 必填 | 說明 |
+|---|---|---|
+| `limit` | 否 | 回傳筆數，預設 `limits.top_n_default_limit`（20），上限 `limits.top_n_max_limit`（500） |
+| `date` | 否 | `YYYY-MM-DD`（台北時區），省略時查當日 |
+
+依 `internetTotalBytes` 由大到小排序。需要 API Key + `[top_n].allowed_ips` 的來源 IP 白名單。
+
+`limit` 超出範圍回 `422`，**不會**靜默夾到上限——夾了的話呼叫端會以為自己拿到了完整的排行。
+
+**對外用量為 0 的主機不會出現。** 只有校內流量的機器列在「流量排行」上只是雜訊，
+所以當日有對外流量的主機不足 `limit` 台時，`count` 會小於 `limit`。
+
+```json
+{
+  "date": "2026-09-15",
+  "limit": 20,
+  "count": 2,
+  "results": [
+    {
+      "ip": "10.1.2.3",
+      "internetDownloadBytes": 4705537592,
+      "internetUploadBytes": 118372641,
+      "internetTotalBytes": 4823910233,
+      "schoolDownloadBytes": 82134901,
+      "schoolUploadBytes": 9927430
+    },
+    {
+      "ip": "10.1.9.8",
+      "internetDownloadBytes": 201338880,
+      "internetUploadBytes": 973066240,
+      "internetTotalBytes": 1174405120,
+      "schoolDownloadBytes": 0,
+      "schoolUploadBytes": 0
     }
   ]
 }

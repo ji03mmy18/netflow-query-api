@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use crate::error::ApiResult;
 use crate::models::{
     BucketUsage, DailyDistribution, DayUsage, ExceededEntry, ExceededReport, IpUsage, TodayUsage,
-    Usage, WeekUsage,
+    TopUsage, Usage, WeekUsage,
 };
 use crate::timeutil::{BUCKETS_PER_DAY, BUCKET_SECONDS, day_bounds_utc, to_taipei_rfc3339};
 
@@ -223,6 +223,52 @@ pub async fn exceeded(
         date: day.to_string(),
         threshold_mib,
         threshold_bytes,
+        count: results.len(),
+        results,
+    })
+}
+
+/// 五、Top-N：當日對外用量最高的 N 台主機
+///
+/// 排除對外用量為 0 的主機：只有校內流量的機器出現在「流量排行」上只是
+/// 雜訊，而且當日有資料的主機不足 N 台時，補幾筆 0 進來並不會讓結果更
+/// 有用。因此回傳筆數可能少於 `limit`。
+pub async fn top_usage(pool: &PgPool, day: NaiveDate, limit: usize) -> ApiResult<TopUsage> {
+    let sql = format!(
+        "SELECT host(addr) AS ip, {BYTE_COLUMNS}
+         FROM flow_stat_1d
+         WHERE day = $1
+           AND ext_rx_bytes + ext_tx_bytes > 0
+         ORDER BY ext_rx_bytes + ext_tx_bytes DESC, addr ASC
+         LIMIT $2"
+    );
+
+    // limit 已在 handler 端被夾在 1..=top_n_max_limit，轉 i64 不會溢位。
+    let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(&sql)
+        .bind(day)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?;
+
+    let results: Vec<IpUsage> = rows
+        .into_iter()
+        .filter_map(|(text, ext_rx, ext_tx, intra_rx, intra_tx)| {
+            match text.parse::<IpAddr>() {
+                Ok(ip) => Some(IpUsage {
+                    ip: ip.to_string(),
+                    usage: Usage::new(ext_rx, ext_tx, intra_rx, intra_tx),
+                }),
+                Err(_) => {
+                    tracing::error!(addr = %text, "host(addr) returned an unparsable address");
+                    None
+                }
+            }
+        })
+        .collect();
+
+    Ok(TopUsage {
+        date: day.to_string(),
+        limit,
         count: results.len(),
         results,
     })

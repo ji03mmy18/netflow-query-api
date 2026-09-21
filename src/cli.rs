@@ -27,7 +27,8 @@ use clap::Parser;
       GET /api/v1/usage/today      today's usage (one or more IPs)\n  \
       GET /api/v1/usage/week       last 7 days (single IP: today + previous 6)\n  \
       GET /api/v1/usage/daily      5-minute distribution for one day (single IP + date)\n  \
-      GET /api/v1/usage/exceeded   over-threshold check (also verifies source IP)\n\n\
+      GET /api/v1/usage/exceeded   over-threshold check (also verifies source IP)\n  \
+      GET /api/v1/usage/top        top talkers by external total (also verifies source IP)\n\n\
       All /api/v1 endpoints require the header: X-API-Key: <key>\n\
       See README.md for parameters and response formats."
 )]

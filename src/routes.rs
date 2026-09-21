@@ -13,7 +13,7 @@ use tower_http::compression::CompressionLayer;
 
 use crate::auth::{AuthenticatedKey, ClientIp};
 use crate::error::{ApiError, ApiResult};
-use crate::models::{DailyDistribution, ExceededReport, TodayUsage, WeekUsage};
+use crate::models::{DailyDistribution, ExceededReport, TodayUsage, TopUsage, WeekUsage};
 use crate::query;
 use crate::state::AppState;
 use crate::timeutil::today_taipei;
@@ -33,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/usage/week", get(week))
         .route("/api/v1/usage/daily", get(daily))
         .route("/api/v1/usage/exceeded", get(exceeded))
+        .route("/api/v1/usage/top", get(top))
         .with_state(state)
         // 只在請求帶 Accept-Encoding: gzip 時才壓縮；沒帶就原樣回傳，
         // 因此不會影響任何既有呼叫端。預設跳過小於 32 bytes 的回應——
@@ -135,23 +136,13 @@ async fn exceeded(
     ClientIp(client_ip): ClientIp,
     Query(params): Query<ExceededParams>,
 ) -> ApiResult<Json<ExceededReport>> {
-    if !state.config.threshold_check_enabled() {
-        tracing::warn!(
-            key = %key.0,
-            %client_ip,
-            "threshold check requested but threshold_check.allowed_ips is empty"
-        );
-        return Err(ApiError::forbidden(
-            "threshold check is disabled: threshold_check.allowed_ips is empty",
-        ));
-    }
-
-    if !state.config.threshold_check_allows(client_ip) {
-        tracing::warn!(key = %key.0, %client_ip, "threshold check rejected: source IP not allowed");
-        return Err(ApiError::forbidden(format!(
-            "source IP {client_ip} is not in the threshold check allow list"
-        )));
-    }
+    require_allowed_source(
+        state.config.threshold_check_enabled(),
+        state.config.threshold_check_allows(client_ip),
+        client_ip,
+        &key.0,
+        "threshold_check",
+    )?;
 
     let threshold_mib = params.threshold_mib;
     if !threshold_mib.is_finite() || threshold_mib < 0.0 {
@@ -175,6 +166,92 @@ async fn exceeded(
 
     let result = query::exceeded(&state.pool, date, threshold_mib, threshold_bytes as i64).await?;
     Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+struct TopParams {
+    /// 選填，回傳筆數。省略時用 `limits.top_n_default_limit`。
+    limit: Option<usize>,
+
+    /// 選填，`YYYY-MM-DD`（台北時區）。省略時查當日。
+    date: Option<String>,
+}
+
+/// 五、Top-N 用量排行
+///
+/// 與 exceeded 一樣會列舉 IP，而且呼叫端連門檻都不必猜就能拿到流量最高的
+/// 主機清單，所以同樣要求來源 IP 落在白名單——只是用獨立的
+/// `[top_n].allowed_ips`，兩支端點可以分別開關。
+async fn top(
+    State(state): State<AppState>,
+    key: AuthenticatedKey,
+    ClientIp(client_ip): ClientIp,
+    Query(params): Query<TopParams>,
+) -> ApiResult<Json<TopUsage>> {
+    require_allowed_source(
+        state.config.top_n_enabled(),
+        state.config.top_n_allows(client_ip),
+        client_ip,
+        &key.0,
+        "top_n",
+    )?;
+
+    let limits = &state.config.config.limits;
+    let limit = params.limit.unwrap_or(limits.top_n_default_limit);
+
+    // 超出範圍回 422 而不是夾到邊界：靜默把 limit=10000 改成 500，呼叫端
+    // 會以為自己拿到了完整的前一萬名。
+    if limit == 0 || limit > limits.top_n_max_limit {
+        return Err(ApiError::validation(format!(
+            "limit must be between 1 and {} (received {limit})",
+            limits.top_n_max_limit
+        )));
+    }
+
+    let date = resolve_date(params.date.as_deref(), today_taipei())?;
+
+    tracing::info!(key = %key.0, %client_ip, limit, %date, "top-n query");
+
+    let result = query::top_usage(&state.pool, date, limit).await?;
+    Ok(Json(result))
+}
+
+/// 會列舉 IP 位址的端點共用的來源檢查。
+///
+/// 白名單為空時視為「該端點未啟用」而非「不限制來源」——漏設定的後果
+/// 應該是查不到，而不是全開。
+fn require_allowed_source(
+    enabled: bool,
+    allowed: bool,
+    client_ip: std::net::IpAddr,
+    key_name: &str,
+    section: &str,
+) -> ApiResult<()> {
+    if !enabled {
+        tracing::warn!(
+            key = %key_name,
+            %client_ip,
+            section,
+            "request rejected: allow list is empty, endpoint is disabled"
+        );
+        return Err(ApiError::forbidden(format!(
+            "this endpoint is disabled: {section}.allowed_ips is empty"
+        )));
+    }
+
+    if !allowed {
+        tracing::warn!(
+            key = %key_name,
+            %client_ip,
+            section,
+            "request rejected: source IP not in allow list"
+        );
+        return Err(ApiError::forbidden(format!(
+            "source IP {client_ip} is not in the {section} allow list"
+        )));
+    }
+
+    Ok(())
 }
 
 /// 解析 IP 清單。
@@ -299,6 +376,28 @@ key = "test-key"
 allowed_ips = ["127.0.0.1"]
 "#;
 
+    /// 與 CONFIG 相同，但只啟用 Top-N（threshold_check 仍為空）。
+    /// 用來驗證兩支端點的白名單互相獨立。
+    const CONFIG_WITH_TOP_N: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 8081
+
+[database]
+host = "127.0.0.1"
+port = 5432
+name = "netflow"
+user = "netflow_ro"
+password = "x"
+
+[[auth.keys]]
+name = "dashboard"
+key = "test-key"
+
+[top_n]
+allowed_ips = ["127.0.0.1"]
+"#;
+
     /// 組出真正的 router，但 pool 用 `connect_lazy_with`——它不會建立任何
     /// 連線，所以不需要資料庫就能測試整條中介層堆疊。
     ///
@@ -321,15 +420,28 @@ allowed_ips = ["127.0.0.1"]
         })
     }
 
-    /// 門檻端點需要 ConnectInfo 才能判斷來源 IP；沒有它會一律拒絕。
-    fn exceeded_request(query: &str) -> Request<Body> {
-        let mut req = request(&format!("/api/v1/usage/exceeded?{query}"))
+    /// 會列舉 IP 的端點需要 ConnectInfo 才能判斷來源；沒有它會一律拒絕。
+    fn signed_request(uri: &str) -> Request<Body> {
+        let mut req = request(uri)
             .header(crate::auth::API_KEY_HEADER, API_KEY)
             .body(Body::empty())
             .unwrap();
         req.extensions_mut()
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
         req
+    }
+
+    fn exceeded_request(query: &str) -> Request<Body> {
+        signed_request(&format!("/api/v1/usage/exceeded?{query}"))
+    }
+
+    fn top_request(query: &str) -> Request<Body> {
+        let uri = if query.is_empty() {
+            "/api/v1/usage/top".to_string()
+        } else {
+            format!("/api/v1/usage/top?{query}")
+        };
+        signed_request(&uri)
     }
 
     fn request(uri: &str) -> axum::http::request::Builder {
@@ -537,5 +649,79 @@ allowed_ips = ["127.0.0.1"]
             text.starts_with('{') && text.contains("VALIDATION_ERROR"),
             "未壓縮的回應應該是可直接閱讀的 JSON，實際為：{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn top_is_closed_when_allow_list_is_empty() {
+        let response = app().oneshot(top_request("")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// threshold_check 有設但 top_n 沒設時，Top-N 仍然關閉。
+    /// 兩份白名單是獨立的，不該互相解鎖。
+    #[tokio::test]
+    async fn top_is_not_unlocked_by_the_threshold_allow_list() {
+        let response = app_with(CONFIG_WITH_THRESHOLD)
+            .oneshot(top_request(""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// 反向：top_n 有設但 threshold_check 沒設時，門檻端點仍然關閉。
+    #[tokio::test]
+    async fn exceeded_is_not_unlocked_by_the_top_n_allow_list() {
+        let response = app_with(CONFIG_WITH_TOP_N)
+            .oneshot(exceeded_request("threshold_mib=1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn top_rejects_zero_limit() {
+        let response = app_with(CONFIG_WITH_TOP_N)
+            .oneshot(top_request("limit=0"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// 超過上限回 422 而不是夾到 500——靜默截斷會讓呼叫端以為
+    /// 自己拿到了完整的排行。
+    #[tokio::test]
+    async fn top_rejects_limit_above_maximum() {
+        let response = app_with(CONFIG_WITH_TOP_N)
+            .oneshot(top_request("limit=501"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn top_rejects_future_date() {
+        let response = app_with(CONFIG_WITH_TOP_N)
+            .oneshot(top_request("date=2099-01-01"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn top_requires_an_api_key() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use std::net::SocketAddr;
+
+        let mut req = Request::builder()
+            .uri("/api/v1/usage/top")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+
+        let response = app_with(CONFIG_WITH_TOP_N).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

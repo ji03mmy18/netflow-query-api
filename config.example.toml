@@ -41,6 +41,15 @@ key = "changeme-monitor-key"
 # 空陣列 = 關閉此端點（fail-closed）。單一 IP 可省略 /32。
 allowed_ips = []
 
+[top_n]
+# GET /api/v1/usage/top 專用的來源 IP 白名單。
+# 該端點直接回傳流量最高的主機清單，呼叫端連門檻都不必猜就能拿到
+# 監控清單的一部分，因此與 threshold_check 一樣額外驗來源 IP。
+#
+# 與 threshold_check 分開設定，兩支端點可以分別開關。
+# 空陣列 = 關閉此端點（fail-closed）。單一 IP 可省略 /32。
+allowed_ips = []
+
 [limits]
 # 當日用量查詢單次可帶的 IP 數量上限
 max_ips_per_request = 50
@@ -49,3 +58,10 @@ max_ips_per_request = 50
 # 必須 <= schema 中 flow_stat_5m 的 retention（目前 13 個月）；
 # 超過此範圍的日期會回 422，而不是靜默回傳一整片 0。
 distribution_max_age_days = 395
+
+# Top-N 排行未指定 limit 時的預設筆數
+top_n_default_limit = 20
+
+# Top-N 排行的 limit 上限。超過會回 422，而不是靜默夾到上限——
+# 靜默截斷會讓呼叫端以為自己拿到了完整的排行。
+top_n_max_limit = 500

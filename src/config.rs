@@ -15,7 +15,9 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub auth: AuthConfig,
     #[serde(default)]
-    pub threshold_check: ThresholdCheckConfig,
+    pub threshold_check: AllowListConfig,
+    #[serde(default)]
+    pub top_n: AllowListConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
 }
@@ -55,8 +57,13 @@ pub struct ApiKeyConfig {
     pub key: String,
 }
 
+/// 來源 IP 白名單。
+///
+/// `[threshold_check]` 與 `[top_n]` 形狀相同——兩者都是「會列舉 IP 位址的
+/// 端點」，都需要在 API Key 之外再驗來源。共用同一個型別，日後加欄位
+/// （例如速率限制）兩邊會一起得到。
 #[derive(Debug, Default, Deserialize)]
-pub struct ThresholdCheckConfig {
+pub struct AllowListConfig {
     #[serde(default)]
     pub allowed_ips: Vec<String>,
 }
@@ -67,6 +74,10 @@ pub struct LimitsConfig {
     pub max_ips_per_request: usize,
     #[serde(default = "default_max_age_days")]
     pub distribution_max_age_days: i64,
+    #[serde(default = "default_top_n_limit")]
+    pub top_n_default_limit: usize,
+    #[serde(default = "default_top_n_max_limit")]
+    pub top_n_max_limit: usize,
 }
 
 impl Default for LimitsConfig {
@@ -74,6 +85,8 @@ impl Default for LimitsConfig {
         Self {
             max_ips_per_request: default_max_ips(),
             distribution_max_age_days: default_max_age_days(),
+            top_n_default_limit: default_top_n_limit(),
+            top_n_max_limit: default_top_n_max_limit(),
         }
     }
 }
@@ -86,6 +99,14 @@ fn default_max_age_days() -> i64 {
     395
 }
 
+fn default_top_n_limit() -> usize {
+    20
+}
+
+fn default_top_n_max_limit() -> usize {
+    500
+}
+
 /// 載入設定並把 CIDR 字串預先解析好。
 ///
 /// 網段在啟動時就解析完畢，而不是每個請求再 parse：一來省掉熱路徑上的
@@ -95,6 +116,7 @@ pub struct LoadedConfig {
     pub config: Config,
     pub trusted_proxies: Vec<IpNetwork>,
     pub threshold_allowed_ips: Vec<IpNetwork>,
+    pub top_n_allowed_ips: Vec<IpNetwork>,
 }
 
 impl LoadedConfig {
@@ -123,11 +145,13 @@ impl LoadedConfig {
         let trusted_proxies = parse_networks(&config.auth.trusted_proxies, "auth.trusted_proxies")?;
         let threshold_allowed_ips =
             parse_networks(&config.threshold_check.allowed_ips, "threshold_check.allowed_ips")?;
+        let top_n_allowed_ips = parse_networks(&config.top_n.allowed_ips, "top_n.allowed_ips")?;
 
         Ok(Self {
             config,
             trusted_proxies,
             threshold_allowed_ips,
+            top_n_allowed_ips,
         })
     }
 
@@ -142,6 +166,15 @@ impl LoadedConfig {
     /// 空白名單代表門檻端點未啟用。
     pub fn threshold_check_enabled(&self) -> bool {
         !self.threshold_allowed_ips.is_empty()
+    }
+
+    pub fn top_n_allows(&self, ip: IpAddr) -> bool {
+        self.top_n_allowed_ips.iter().any(|net| net.contains(ip))
+    }
+
+    /// 空白名單代表 Top-N 端點未啟用。
+    pub fn top_n_enabled(&self) -> bool {
+        !self.top_n_allowed_ips.is_empty()
     }
 }
 
