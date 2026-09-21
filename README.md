@@ -239,9 +239,18 @@ GET /api/v1/usage/daily?ip=10.1.2.3                 # date 省略 = 當日
 ### 4. 過量門檻檢查
 
 ```
-GET /api/v1/usage/exceeded?threshold_mib=1024
-GET /api/v1/usage/exceeded?thresholdMib=1024      # 兩種寫法都接受
+GET /api/v1/usage/exceeded?threshold_mib=1024                  # 當日
+GET /api/v1/usage/exceeded?threshold_mib=1024&date=2026-09-15  # 指定日期
+GET /api/v1/usage/exceeded?thresholdMib=1024                   # 門檻參數兩種寫法都接受
 ```
+
+| 參數 | 必填 | 說明 |
+|---|---|---|
+| `threshold_mib` | 是 | 門檻值，單位 MiB（亦接受 `thresholdMib`） |
+| `date` | 否 | `YYYY-MM-DD`（台北時區），省略時查當日 |
+
+`date` 不接受未來日期。沒有回溯下限——`flow_stat_1d` 不設 retention，長期保留，
+這點與 `/usage/daily` 不同（後者讀 `flow_stat_5m`，只有 13 個月）。
 
 回傳當日 `internetTotalBytes`（對外合計）**超過**門檻的所有 IP，依 `internetTotalBytes` 由大到小排序。
 門檻固定比對對外流量，`school*` 不納入計算。需要 API Key + 來源 IP 白名單。
@@ -254,13 +263,16 @@ GET /api/v1/usage/exceeded?thresholdMib=1024      # 兩種寫法都接受
 | `overThresholdMib` | 同上換算 MiB，**無條件捨去** |
 | `overThresholdGib` | 同上換算 GiB，**無條件捨去** |
 
+回應的 `date` 欄位是**實際查詢的日期**，可用來確認省略參數時伺服器認定的「今日」
+是哪一天（台北時區）。
+
 ⚠ 捨去後可能是 `0`：一台超標 512 KiB 的主機，`overThresholdMib` 與 `overThresholdGib`
 都會是 `0`。這不是錯誤——`0` 的讀法是「不到一個完整單位」，精確值一律看
 `overThresholdBytes`。門檻若設在 GiB 等級，`overThresholdGib` 多數時候都會是 0。
 
 ```json
 {
-  "date": "2026-09-18",
+  "date": "2026-09-15",
   "thresholdMib": 1024.0,
   "thresholdBytes": 1073741824,
   "count": 2,

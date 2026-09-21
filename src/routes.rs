@@ -94,17 +94,7 @@ async fn daily(
 ) -> ApiResult<Json<DailyDistribution>> {
     let ip = parse_single_ip(&params.ip)?;
     let today = today_taipei();
-
-    let date = match params.date.as_deref() {
-        Some(raw) => parse_date(raw)?,
-        None => today,
-    };
-
-    if date > today {
-        return Err(ApiError::validation(format!(
-            "date {date} is in the future (today is {today})"
-        )));
-    }
+    let date = resolve_date(params.date.as_deref(), today)?;
 
     // flow_stat_5m 有 retention policy，超過保留期的 chunk 已被刪除。
     // 若照常查下去會回一整片 0，看起來像「那天完全沒流量」而不是
@@ -129,6 +119,9 @@ struct ExceededParams {
     /// 只支援一種，必然會有人照著回應的欄位名去拼參數然後拿到 422。
     #[serde(alias = "thresholdMib")]
     threshold_mib: f64,
+
+    /// 選填，`YYYY-MM-DD`（台北時區）。省略時查當日。
+    date: Option<String>,
 }
 
 /// 四、過量門檻檢查
@@ -174,10 +167,13 @@ async fn exceeded(
         return Err(ApiError::validation("threshold_mib is too large"));
     }
 
-    tracing::info!(key = %key.0, %client_ip, threshold_mib, "threshold check");
+    // flow_stat_1d 沒有 retention policy（schema 明言長期保留），所以這裡
+    // 只擋未來日期，不像 daily 還要擋過舊的日期。
+    let date = resolve_date(params.date.as_deref(), today_taipei())?;
 
-    let result =
-        query::exceeded(&state.pool, today_taipei(), threshold_mib, threshold_bytes as i64).await?;
+    tracing::info!(key = %key.0, %client_ip, threshold_mib, %date, "threshold check");
+
+    let result = query::exceeded(&state.pool, date, threshold_mib, threshold_bytes as i64).await?;
     Ok(Json(result))
 }
 
@@ -223,6 +219,25 @@ fn parse_single_ip(raw: &str) -> ApiResult<IpAddr> {
         .map_err(|_| ApiError::validation(format!("\"{raw}\" is not a valid IP address")))
 }
 
+/// 解析選填的 `date` 參數，省略時用今天；不接受未來日期。
+///
+/// daily 與 exceeded 共用：未來日期的判斷若在兩處各寫一次，日後只改一邊
+/// 就會出現「這支端點接受明天、那支不接受」這種說不出道理的差異。
+fn resolve_date(raw: Option<&str>, today: NaiveDate) -> ApiResult<NaiveDate> {
+    let date = match raw {
+        Some(raw) => parse_date(raw)?,
+        None => today,
+    };
+
+    if date > today {
+        return Err(ApiError::validation(format!(
+            "date {date} is in the future (today is {today})"
+        )));
+    }
+
+    Ok(date)
+}
+
 fn parse_date(raw: &str) -> ApiResult<NaiveDate> {
     NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
         .map_err(|_| ApiError::validation(format!("date \"{raw}\" must be in YYYY-MM-DD format")))
@@ -262,18 +277,59 @@ name = "dashboard"
 key = "test-key"
 "#;
 
+    /// 與 CONFIG 相同，但啟用了門檻檢查，來源允許 127.0.0.1。
+    /// 用來測試門檻端點在通過授權之後的參數驗證。
+    const CONFIG_WITH_THRESHOLD: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 8081
+
+[database]
+host = "127.0.0.1"
+port = 5432
+name = "netflow"
+user = "netflow_ro"
+password = "x"
+
+[[auth.keys]]
+name = "dashboard"
+key = "test-key"
+
+[threshold_check]
+allowed_ips = ["127.0.0.1"]
+"#;
+
     /// 組出真正的 router，但 pool 用 `connect_lazy_with`——它不會建立任何
     /// 連線，所以不需要資料庫就能測試整條中介層堆疊。
     ///
     /// 條件是測試請求不能走到查詢：認證失敗、參數驗證失敗、門檻端點的
     /// 來源 IP 檢查、healthz 都在碰資料庫之前就回應了。
     fn app() -> Router {
-        let config = LoadedConfig::from_toml_str(CONFIG).expect("test config should be valid");
-        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        app_with(CONFIG)
+    }
+
+    fn app_with(toml: &str) -> Router {
+        let config = LoadedConfig::from_toml_str(toml).expect("test config should be valid");
+        // acquire_timeout 設得極短：這些測試預期都不該走到查詢，萬一有測試
+        // 意外碰到資料庫，要立刻失敗而不是卡滿預設的 30 秒逾時。
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_lazy_with(PgConnectOptions::new());
         router(AppState {
             pool,
             config: Arc::new(config),
         })
+    }
+
+    /// 門檻端點需要 ConnectInfo 才能判斷來源 IP；沒有它會一律拒絕。
+    fn exceeded_request(query: &str) -> Request<Body> {
+        let mut req = request(&format!("/api/v1/usage/exceeded?{query}"))
+            .header(crate::auth::API_KEY_HEADER, API_KEY)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        req
     }
 
     fn request(uri: &str) -> axum::http::request::Builder {
@@ -345,16 +401,68 @@ key = "test-key"
     /// （fail-closed）。漏設定的後果應該是查不到，而不是全開。
     #[tokio::test]
     async fn threshold_endpoint_is_closed_when_allow_list_is_empty() {
-        let mut req = request("/api/v1/usage/exceeded?threshold_mib=1")
-            .header(crate::auth::API_KEY_HEADER, API_KEY)
-            .body(Body::empty())
+        let response = app()
+            .oneshot(exceeded_request("threshold_mib=1"))
+            .await
             .unwrap();
-        req.extensions_mut()
-            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
-
-        let response = app().oneshot(req).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// date 是選填的；省略時查當日。這裡只驗證參數驗證有放行——
+    /// 實際查詢需要資料庫，不在這個測試的範圍。
+    #[tokio::test]
+    async fn exceeded_rejects_future_date() {
+        let response = app_with(CONFIG_WITH_THRESHOLD)
+            .oneshot(exceeded_request("threshold_mib=1&date=2099-01-01"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn exceeded_rejects_malformed_date() {
+        let response = app_with(CONFIG_WITH_THRESHOLD)
+            .oneshot(exceeded_request("threshold_mib=1&date=2026%2F09%2F01"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// 釘住 `parse_date` 的實際行為。
+    ///
+    /// chrono 的 `%m` / `%d` 接受未補零的數字，所以 `2026-9-1` 是合法輸入
+    /// ——這跟錯誤訊息裡寫的 "YYYY-MM-DD" 讀起來不太一樣，寫下來免得日後
+    /// 有人照字面假設它是嚴格的。
+    #[test]
+    fn parse_date_behaviour() {
+        assert!(parse_date("2026-09-01").is_ok());
+        assert!(parse_date("2026-9-1").is_ok(), "未補零的數字是被接受的");
+
+        assert!(parse_date("2026/09/01").is_err(), "分隔符必須是 -");
+        assert!(parse_date("20260901").is_err(), "不能省略分隔符");
+        assert!(parse_date("2026-13-01").is_err(), "月份超出範圍");
+        assert!(parse_date("2026-02-30").is_err(), "日期不存在");
+        assert!(parse_date("2026-09-01T00:00:00Z").is_err(), "不接受時間部分");
+        assert!(parse_date("").is_err());
+    }
+
+    /// daily 與 exceeded 共用 resolve_date，未來日期的行為必須一致。
+    #[tokio::test]
+    async fn daily_rejects_future_date() {
+        let response = app()
+            .oneshot(
+                request("/api/v1/usage/daily?ip=10.1.2.3&date=2099-01-01")
+                    .header(crate::auth::API_KEY_HEADER, API_KEY)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// 帶 Accept-Encoding: gzip 時回應要被壓縮，且解開後與未壓縮版本相同。
